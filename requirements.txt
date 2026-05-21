@@ -1,0 +1,6 @@
+declare4py
+openai
+pandas
+pm4py
+pypdf
+python-dotenv
