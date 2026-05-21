@@ -68,9 +68,6 @@ Main logical structure:
 - `llm_disagreement/`  
   Outputs for LLM vs deterministic conformance comparison.
 
-- `_old/`  
-  Historical/personal material not part of the current workflow.
-
 ## Key Outputs
 
 - `event_rules/workflow_rules.json` e `event_rules/workflow_rules.csv`
