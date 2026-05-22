@@ -80,7 +80,7 @@ RUN_META_PATH = OUT_DIR / "llm_disagreement_run_metadata.csv"  # NEW
 RULES_USED_PATH = OUT_DIR / "rules_used.txt"  # NEW
 
 # OpenAI
-MODEL = "gpt-5.2"
+MODEL = "gpt-5.4"
 TEMPERATURE = 0.0
 MAX_OUTPUT_TOKENS = 700
 
