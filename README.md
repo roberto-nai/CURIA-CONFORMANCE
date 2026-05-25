@@ -76,7 +76,7 @@ Main logical structure:
 
 ## Key Outputs
 
-- `event_rules/workflow_rules.json` e `event_rules/workflow_rules.csv`
+- `event_rules/workflow_rules.json` and `event_rules/workflow_rules.csv`
 - `declare_model/curia_model.decl`
 - `conformance_results/conformance_results.csv`
 - `conformance_impact/conformance_impact.csv`
