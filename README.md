@@ -19,6 +19,14 @@ source venv312/bin/activate
 pip install -r requirements.txt
 ```
 
+## Pipeline
+
+<p align="center">
+  <img src="pipeline.png" alt="CURIA conformance pipeline" width="900">
+</p>
+
+<p align="center"><em>Overview of the end-to-end CURIA conformance analysis pipeline.</em></p>
+
 ## Script Execution Order
 
 Recommended end-to-end order:
