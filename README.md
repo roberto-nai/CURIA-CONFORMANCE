@@ -34,12 +34,12 @@ Recommended end-to-end order:
    
    Input data: CURIA regulatory text source (PDF) from `curia_texts/` and prompt/configuration parameters in the script.
    
-   Output data: rule extraction artifacts in `event_rules/`, including `workflow_rules.json`, `workflow_rules.csv`, and extraction prompt trace.
+   Output data: rule extraction artifacts in `curia_rules/`, including `workflow_rules.json`, `workflow_rules.csv`, and extraction prompt trace.
 
 2. `02_declare_model.py`  
    Converts rules into an executable Declare model and generates build/validation reports.
    
-   Input data: extracted rule set from `event_rules/workflow_rules.json` or `event_rules/workflow_rules.csv`.
+   Input data: extracted rule set from `curia_rules/workflow_rules.json` or `curia_rules/workflow_rules.csv`.
   
    Output data: Declare model file and validation/build diagnostics in `declare_model/` (for example `curia_model.decl` and build report files).
 
