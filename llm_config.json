@@ -1,0 +1,29 @@
+{
+  "gpt-4.1-2025-04-14": {
+    "provider": "OpenAI",
+    "release_date": "2025-04-14",
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "max_output_tokens": 512,
+    "response_format": "JSON",
+    "tools": "disabled"
+  },
+  "claude-sonnet-4-5-20250929": {
+    "provider": "Anthropic",
+    "release_date": "2025-09-29",
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "max_output_tokens": 512,
+    "response_format": "JSON",
+    "tools": "disabled"
+  },
+  "llama3.2": {
+    "provider": "Ollama",
+    "release_date": "2024-09-25",
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "max_output_tokens": 512,
+    "response_format": "JSON",
+    "tools": "disabled"
+  }
+}

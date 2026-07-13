@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-07_llm_disagreement_study.py
+05_llm_disagreement_study.py
 
 LLM disagreement study vs deterministic Declare conformance.
 
@@ -27,17 +27,20 @@ Outputs
 
 Requirements
 ------------
-pip install openai python-dotenv pandas
+pip install openai anthropic python-dotenv pandas
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 from datetime import datetime, timezone
+import argparse
 import json
 import os
 import random
 import re
+import time
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Set
 
 import pandas as pd
@@ -53,12 +56,14 @@ CSV_SEP = ";"
 
 # Inputs
 CONFORMANCE_PATH = Path("conformance_results/conformance_results.csv")
-GOLD_RULES_PATH = Path("event_rules/workflow_rules.csv")
+GOLD_RULES_PATH = Path("curia_rules/workflow_rules.csv") # event_rules
 LOG_PATH = Path("event_log/curia_log_en.csv")
+LLM_CONFIG_PATH = Path("llm_config.json")
+LLM_PROMPTS_PATH = Path("llm_prompts.json")
 
 # Impact ranking (to select top-N rules)
 IMPACT_PATH = Path("conformance_impact/conformance_impact.csv")
-N_RULES = 3  # top rules to evaluate (from IMPACT_PATH)
+N_RULES = 5  # top rules to evaluate (from IMPACT_PATH)
 
 # Sampling knobs
 SAMPLES_PER_RULE_PER_CLASS = 30  # K compliant + K violating per rule (if available)
@@ -78,11 +83,6 @@ PER_RULE_PATH = OUT_DIR / "llm_disagreement_per_rule.csv"
 MISMATCHES_PATH = OUT_DIR / "llm_disagreement_mismatches.csv"
 RUN_META_PATH = OUT_DIR / "llm_disagreement_run_metadata.csv"  # NEW
 RULES_USED_PATH = OUT_DIR / "rules_used.txt"  # NEW
-
-# OpenAI
-MODEL = "gpt-5.4"
-TEMPERATURE = 0.0
-MAX_OUTPUT_TOKENS = 700
 
 # Study design
 SEED = 7
@@ -120,6 +120,14 @@ def round_float_columns(df: pd.DataFrame, precision: int) -> pd.DataFrame:
     float_cols = df.select_dtypes(include=["float", "float32", "float64"]).columns
     df[float_cols] = df[float_cols].round(precision)
     return df
+
+
+def csv_path_for_model(path: Path, model: str) -> Path:
+    """Add a filesystem-safe model suffix before a CSV file extension."""
+    safe_model = re.sub(r"[^A-Za-z0-9_-]+", "_", model).strip("_")
+    if not safe_model:
+        raise ValueError(f"Model name {model!r} cannot be converted to a safe filename.")
+    return path.with_name(f"{path.stem}_{safe_model}{path.suffix}")
 
 
 def load_conformance_matrix(path: Path) -> pd.DataFrame:
@@ -200,6 +208,27 @@ def load_log(path: Path) -> pd.DataFrame:
 
     df = df.sort_values(["CaseID", "Timestamp", "Activity"], kind="mergesort").reset_index(drop=True)
     return df
+
+
+def load_llm_config(path: Path) -> Dict[str, Dict[str, Any]]:
+    """Load and minimally validate the model-keyed LLM configuration."""
+    with path.open("r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    if not isinstance(config, dict) or not config:
+        raise ValueError(f"{path} must contain a non-empty JSON object.")
+
+    required = {
+        "provider", "temperature", "top_p", "max_output_tokens",
+        "response_format", "tools",
+    }
+    for model, settings in config.items():
+        if not isinstance(settings, dict):
+            raise ValueError(f"Configuration for model {model!r} must be an object.")
+        missing = required - settings.keys()
+        if missing:
+            raise ValueError(f"Model {model!r} is missing settings: {sorted(missing)}")
+    return config
 
 
 def select_top_rules_from_impact(
@@ -436,7 +465,10 @@ def sample_pairs_balanced_per_rule(
         ok_cases = col[col != VIOLATION_VALUE].index.tolist()
 
         if not viol_cases or not ok_cases:
-            print(f"[{constraint}] skipped (viol={len(viol_cases)}, ok={len(ok_cases)})")
+            print(
+                f"[{constraint}] skipped "
+                f"(violations={len(viol_cases)}, compliant={len(ok_cases)})"
+            )
             continue
 
         k_v = min(samples_per_rule_per_class, len(viol_cases))
@@ -448,8 +480,8 @@ def sample_pairs_balanced_per_rule(
         k_o = min(k_o, per_rule_cap_each)
 
         print(
-            f"[{constraint}] available: viol={len(viol_cases)}, ok={len(ok_cases)} | "
-            f"sampled: viol={k_v}, ok={k_o}"
+            f"[{constraint}] available: violations={len(viol_cases)}, "
+            f"compliant={len(ok_cases)} | sampled: violations={k_v}, compliant={k_o}"
         )
 
         sampled_v = rnd.sample(viol_cases, k=k_v)
@@ -469,11 +501,26 @@ def sample_pairs_balanced_per_rule(
 # LLM prompt + call
 # =============================
 
+@lru_cache(maxsize=None)
+def load_llm_prompt(path: Path, prompt_key: str) -> str:
+    """Load a prompt template identified by its key from a JSON file."""
+    with path.open("r", encoding="utf-8") as f:
+        prompts = json.load(f)
+
+    if not isinstance(prompts, dict):
+        raise ValueError(f"{path} must contain a JSON object.")
+
+    prompt = prompts.get(prompt_key)
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError(f"Prompt key {prompt_key!r} is missing or empty in {path}.")
+    return prompt
+
 def build_llm_prompt(
     case_id: str,
     constraint: str,
     gold_meta: Dict[str, str],
     trace_text: str,
+    prompt_key: str = "prompt_1",
 ) -> str:
     """
     Build the LLM prompt for one (case, constraint) evaluation.
@@ -483,44 +530,22 @@ def build_llm_prompt(
         constraint: Declare-style constraint name.
         gold_meta: GOLD metadata used to contextualize the rule.
         trace_text: Plain-text representation of the case trace.
+        prompt_key: Key of the prompt to load from `llm_prompts.json`.
 
     Returns:
         Prompt string for the Responses API call.
     """
-    return f"""
-You are a legal process compliance analyst.
-
-TASK
-Given:
-1) a workflow compliance rule (natural language + Declare-style constraint name),
-2) a case trace (timestamp | activity),
-decide whether the case is COMPLIANT with the rule.
-
-IMPORTANT
-- You must base your decision ONLY on the provided trace and the rule text below.
-- If the trace does not contain enough information to decide, answer "uncertain" and explain why.
-- Return ONLY valid JSON (no prose).
-
-OUTPUT JSON KEYS
-- case_id: string
-- constraint: string
-- gold_rule_id: string (may be empty)
-- llm_label: one of ["compliant","violation","uncertain"]
-- confidence: number between 0 and 1
-- rationale: string (2-4 sentences, plain English)
-- evidence_lines: array of up to 3 strings copied from the trace that support your judgement
-
-RULE
-- Declare constraint name: {constraint}
-- GOLD rule id: {gold_meta.get("gold_rule_id","")}
-- GOLD rule name: {gold_meta.get("gold_rule_name","")}
-- GOLD natural-language rule: {gold_meta.get("gold_nl_rule","")}
-- Excerpt reference: {gold_meta.get("gold_excerpt_reference","")}
-- Assumptions: {gold_meta.get("gold_assumptions","")}
-
-CASE TRACE
-{trace_text}
-""".strip()
+    prompt_template = load_llm_prompt(LLM_PROMPTS_PATH, prompt_key)
+    return prompt_template.format(
+        case_id=case_id,
+        constraint=constraint,
+        gold_rule_id=gold_meta.get("gold_rule_id", ""),
+        gold_rule_name=gold_meta.get("gold_rule_name", ""),
+        gold_nl_rule=gold_meta.get("gold_nl_rule", ""),
+        gold_excerpt_reference=gold_meta.get("gold_excerpt_reference", ""),
+        gold_assumptions=gold_meta.get("gold_assumptions", ""),
+        trace_text=trace_text,
+    ).strip()
 
 
 def _safe_usage_total_tokens(resp: Any) -> int:
@@ -539,31 +564,135 @@ def _safe_usage_total_tokens(resp: Any) -> int:
     return int(getattr(usage, "total_tokens", 0) or 0)
 
 
-def call_llm_json(client: OpenAI, prompt: str) -> Tuple[Dict[str, Any], int]:
+def create_llm_client(provider: str) -> Any:
+    """Create the native/provider-compatible client using environment variables."""
+    provider_lower = provider.strip().lower()
+    if provider_lower == "openai":
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise EnvironmentError("OPENAI_API_KEY not found in the environment or .env file.")
+        return OpenAI(api_key=api_key)
+
+    if provider_lower == "anthropic":
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise EnvironmentError("ANTHROPIC_API_KEY not found in the environment or .env file.")
+        try:
+            from anthropic import Anthropic
+        except ImportError as exc:
+            raise ImportError("Install the Anthropic SDK with: pip install anthropic") from exc
+        return Anthropic(api_key=api_key)
+
+    if provider_lower == "ollama":
+        base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+        return OpenAI(api_key="ollama", base_url=base_url)
+
+    if provider_lower == "meta":
+        api_key = os.getenv("META_API_KEY")
+        base_url = os.getenv("META_BASE_URL")
+        if not api_key or not base_url:
+            raise EnvironmentError(
+                "META_API_KEY and META_BASE_URL are required for the Meta model. "
+                "META_BASE_URL must point to an OpenAI-compatible inference endpoint."
+            )
+        return OpenAI(api_key=api_key, base_url=base_url)
+
+    raise ValueError(f"Unsupported LLM provider: {provider!r}")
+
+
+def parse_model_json(text: str) -> Dict[str, Any]:
+    """Parse a JSON object, tolerating surrounding prose or Markdown fences."""
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as direct_error:
+        object_start = text.find("{")
+        if object_start < 0:
+            raise direct_error
+        try:
+            payload, _ = json.JSONDecoder().raw_decode(text, object_start)
+        except json.JSONDecodeError:
+            raise direct_error
+
+    if not isinstance(payload, dict):
+        raise ValueError("Model output JSON must be an object.")
+    return payload
+
+
+def call_llm_json(
+    client: Any,
+    prompt: str,
+    *,
+    model: str,
+    settings: Dict[str, Any],
+) -> Tuple[Dict[str, Any], int]:
     """
     Call the model and parse JSON output defensively.
 
     Args:
-        client: OpenAI client instance.
+        client: Provider-specific client instance.
         prompt: Prompt text sent to the model.
+        model: Model identifier, taken from the JSON object key.
+        settings: Provider and generation parameters loaded from JSON.
 
     Returns:
         Tuple `(parsed_json, tokens_used_for_call)`.
         On invalid JSON, a fallback payload with `llm_label='uncertain'` is
         returned.
     """
-    resp = client.responses.create(
-        model=MODEL,
-        input=prompt,
-        temperature=TEMPERATURE,
-        max_output_tokens=MAX_OUTPUT_TOKENS,
-    )
-    tokens_used = _safe_usage_total_tokens(resp)
+    provider = str(settings["provider"]).strip().lower()
+    temperature = float(settings["temperature"])
+    top_p = float(settings["top_p"])
+    max_tokens = int(settings["max_output_tokens"])
+    json_response = str(settings["response_format"]).strip().upper() == "JSON"
 
-    text = resp.output_text.strip()
+    if provider == "openai":
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "input": prompt,
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_output_tokens": max_tokens,
+        }
+        if json_response:
+            kwargs["text"] = {"format": {"type": "json_object"}}
+        resp = client.responses.create(**kwargs)
+        tokens_used = _safe_usage_total_tokens(resp)
+        text = resp.output_text.strip()
+    elif provider == "anthropic":
+        # Anthropic models may reject requests containing both sampling
+        # parameters. Use temperature and leave top_p at the model default.
+        resp = client.messages.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        usage = getattr(resp, "usage", None)
+        tokens_used = int(getattr(usage, "input_tokens", 0) or 0) + int(
+            getattr(usage, "output_tokens", 0) or 0
+        )
+        text = "".join(
+            block.text for block in resp.content if getattr(block, "type", "") == "text"
+        ).strip()
+    elif provider in {"meta", "ollama"}:
+        kwargs = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_tokens": max_tokens,
+        }
+        if json_response:
+            kwargs["response_format"] = {"type": "json_object"}
+        resp = client.chat.completions.create(**kwargs)
+        tokens_used = _safe_usage_total_tokens(resp)
+        text = (resp.choices[0].message.content or "").strip()
+    else:
+        raise ValueError(f"Unsupported LLM provider: {settings['provider']!r}")
+
     try:
-        return json.loads(text), tokens_used
-    except json.JSONDecodeError:
+        return parse_model_json(text), tokens_used
+    except (json.JSONDecodeError, ValueError):
         return (
             {
                 "case_id": None,
@@ -622,6 +751,24 @@ def compute_summary(
     Returns:
         Tuple `(summary_df, per_rule_df)` with aggregated metrics.
     """
+    if "model" in df_res.columns:
+        summary_parts: List[pd.DataFrame] = []
+        per_rule_parts: List[pd.DataFrame] = []
+        for model, model_df in df_res.groupby("model", sort=False):
+            model_df = model_df.drop(columns=["model"])
+            summary_part, per_rule_part = compute_summary(
+                model_df,
+                n_cases_total=n_cases_total,
+                n_cases_sampled=n_cases_sampled,
+                sample_fraction=sample_fraction,
+                top_k_rules_used=top_k_rules_used,
+            )
+            summary_part.insert(0, "model", model)
+            per_rule_part.insert(0, "model", model)
+            summary_parts.append(summary_part)
+            per_rule_parts.append(per_rule_part)
+        return pd.concat(summary_parts, ignore_index=True), pd.concat(per_rule_parts, ignore_index=True)
+
     df = df_res.copy()
     df["llm_bin"] = df["llm_label"].apply(llm_label_to_binary)
     df["is_uncertain"] = df["llm_bin"].isna()
@@ -673,6 +820,24 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def parse_cli_args() -> argparse.Namespace:
+    """Parse and return the model and prompt selected from the command line."""
+    parser = argparse.ArgumentParser(
+        description="Compare one configured LLM against deterministic Declare conformance."
+    )
+    parser.add_argument(
+        "model",
+        help="Model key defined in llm_config.json.",
+    )
+    parser.add_argument(
+        "prompt",
+        nargs="?",
+        default="prompt_1",
+        help="Prompt key defined in llm_prompts.json (default: prompt_1).",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
     """
     Run the full LLM disagreement study pipeline.
@@ -684,6 +849,34 @@ def main() -> None:
     4. Query the LLM and collect row-level comparisons.
     5. Compute summaries and save all output artifacts.
     """
+    args = parse_cli_args()
+    full_llm_config = load_llm_config(LLM_CONFIG_PATH)
+    if args.model not in full_llm_config:
+        available_models = ", ".join(full_llm_config.keys())
+        raise SystemExit(
+            f"Unknown model {args.model!r}. Available models: {available_models}"
+        )
+
+    try:
+        load_llm_prompt(LLM_PROMPTS_PATH, args.prompt)
+    except ValueError as exc:
+        with LLM_PROMPTS_PATH.open("r", encoding="utf-8") as f:
+            available_prompts = ", ".join(json.load(f).keys())
+        raise SystemExit(
+            f"Unknown prompt {args.prompt!r}. Available prompts: {available_prompts}"
+        ) from exc
+
+    llm_config = {args.model: full_llm_config[args.model]}
+    results_path = csv_path_for_model(RESULTS_PATH, args.model)
+    summary_path = csv_path_for_model(SUMMARY_PATH, args.model)
+    per_rule_path = csv_path_for_model(PER_RULE_PATH, args.model)
+    mismatches_path = csv_path_for_model(MISMATCHES_PATH, args.model)
+    run_meta_path = csv_path_for_model(RUN_META_PATH, args.model)
+
+    program_start_dt = datetime.now().astimezone()
+    program_start_timer = time.perf_counter()
+    print(f"Programme started: {program_start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # ---- Run metadata start ----
@@ -691,10 +884,13 @@ def main() -> None:
     start_dt = datetime.now(timezone.utc)
 
     load_dotenv()
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise EnvironmentError("OPENAI_API_KEY not found. Put it in your .env file.")
-    client = OpenAI(api_key=api_key)
+    clients = {
+        model: create_llm_client(str(settings["provider"]))
+        for model, settings in llm_config.items()
+    }
+    print(f"Selected model: {args.model}")
+    print(f"Selected prompt: {args.prompt}")
+    print()
 
     print("> Loading inputs")
     df_conf = load_conformance_matrix(CONFORMANCE_PATH)
@@ -744,8 +940,10 @@ def main() -> None:
     all_case_ids = df_conf.index.tolist()
     eligible_case_ids = sample_case_ids(all_case_ids, fraction=SAMPLE_FRACTION, seed=SEED)
     print(f"Eligible CaseIDs sampled: {len(eligible_case_ids)} / {len(all_case_ids)} (fraction={SAMPLE_FRACTION:.3f})")
+    print()
 
     # 2) Sample pairs (balanced per rule, only among eligible CaseIDs), and capped
+    print("> Sampling (case, rule) pairs for evaluation")
     pairs = sample_pairs_balanced_per_rule(
         df_conf,
         eligible_case_ids,
@@ -755,17 +953,33 @@ def main() -> None:
         max_pairs_per_rule=MAX_PAIRS_PER_RULE,
     )
     print(f"Sampled (case, rule) pairs: {len(pairs)} (CAP={MAX_TOTAL_PAIRS})")
+    print()
 
     # ---- LLM accounting ----
+    print("> LLM evaluation")
     llm_queries_executed = 0
     total_tokens_used = 0
 
     rows: List[Dict[str, Any]] = []
+    current_model: Optional[str] = None
+    model_start_timer: Optional[float] = None
+    model, settings = next(iter(llm_config.items()))
     for case_id, constraint, det_label in pairs:
+        if model != current_model:
+            if current_model is not None:
+                model_minutes = (time.perf_counter() - model_start_timer) / 60.0
+                print(f"Model completed: {current_model} ({model_minutes:.2f} minutes) \n")
+            print(f"Will evaluate model: {model} ({settings['provider']})")
+            current_model = model
+            model_start_timer = time.perf_counter()
+
+        client = clients[model]
         trace_df = traces.get(case_id)
 
         if trace_df is None:
             rows.append({
+                "model": model,
+                "prompt": args.prompt,
                 "case_id": case_id,
                 "constraint": constraint,
                 "det_label": det_label,
@@ -784,9 +998,20 @@ def main() -> None:
         trace_text = trace_to_text(trace_df, max_events=MAX_EVENTS_IN_PROMPT)
         gold_meta = lookup_gold_for_constraint(constraint, gold_df)
 
-        prompt = build_llm_prompt(case_id, constraint, gold_meta, trace_text)
+        prompt = build_llm_prompt(
+            case_id,
+            constraint,
+            gold_meta,
+            trace_text,
+            prompt_key=args.prompt,
+        )
 
-        out, tokens_used = call_llm_json(client, prompt)
+        out, tokens_used = call_llm_json(
+            client,
+            prompt,
+            model=model,
+            settings=settings,
+        )
         llm_queries_executed += 1
         total_tokens_used += int(tokens_used)
 
@@ -794,10 +1019,14 @@ def main() -> None:
         conf = float(out.get("confidence", 0.0)) if out.get("confidence") is not None else 0.0
         rationale = str(out.get("rationale", "")).strip()
 
-        ev = out.get("evidence_lines", [])
+        # Accept the former key as a compatibility fallback for model outputs
+        # generated with an older prompt version.
+        ev = out.get("evidence_lines", out.get("evidence_events", []))
         ev_str = json.dumps(ev if isinstance(ev, list) else [], ensure_ascii=False)
 
         rows.append({
+            "model": model,
+            "prompt": args.prompt,
             "case_id": case_id,
             "constraint": constraint,
             "det_label": det_label,  # 1=violation, 0=compliant
@@ -811,6 +1040,10 @@ def main() -> None:
             "gold_assumptions": gold_meta.get("gold_assumptions", ""),
             "gold_nl_rule": gold_meta.get("gold_nl_rule", ""),
         })
+
+    if current_model is not None:
+        model_minutes = (time.perf_counter() - model_start_timer) / 60.0
+        print(f"Model completed: {current_model} ({model_minutes:.2f} minutes)")
 
     df_res = pd.DataFrame(rows)
 
@@ -834,10 +1067,10 @@ def main() -> None:
     per_rule_df = round_float_columns(per_rule_df, FLOAT_PRECISION)
     mismatches = round_float_columns(mismatches, FLOAT_PRECISION)
 
-    df_res.to_csv(RESULTS_PATH, sep=CSV_SEP, index=False)
-    summary_df.to_csv(SUMMARY_PATH, sep=CSV_SEP, index=False)
-    per_rule_df.to_csv(PER_RULE_PATH, sep=CSV_SEP, index=False)
-    mismatches.to_csv(MISMATCHES_PATH, sep=CSV_SEP, index=False)
+    df_res.to_csv(results_path, sep=CSV_SEP, index=False)
+    summary_df.to_csv(summary_path, sep=CSV_SEP, index=False)
+    per_rule_df.to_csv(per_rule_path, sep=CSV_SEP, index=False)
+    mismatches.to_csv(mismatches_path, sep=CSV_SEP, index=False)
 
     # ---- Run metadata end (NEW) ----
     end_ts = _utc_now_iso()
@@ -850,20 +1083,34 @@ def main() -> None:
         "delta_minutes": round(delta_minutes, FLOAT_PRECISION),
         "llm_queries_executed": int(llm_queries_executed),
         "total_tokens_used": int(total_tokens_used),
+        "models": " | ".join(llm_config.keys()),
+        "n_models": len(llm_config),
+        "prompt": args.prompt,
     }])
-    run_meta_df.to_csv(RUN_META_PATH, sep=CSV_SEP, index=False)
+    run_meta_df.to_csv(run_meta_path, sep=CSV_SEP, index=False)
 
-    print(f"Saved results: {RESULTS_PATH}")
-    print(f"Saved summary: {SUMMARY_PATH}")
-    print(f"Saved per-rule: {PER_RULE_PATH}")
-    print(f"Saved mismatches: {MISMATCHES_PATH}")
-    print(f"Saved run metadata: {RUN_META_PATH}")
+    print("\n=== OUTPUT FILES ===")
+    print(f"Saved results: {results_path}")
+    print(f"Saved summary: {summary_path}")
+    print(f"Saved per-rule: {per_rule_path}")
+    print(f"Saved mismatches: {mismatches_path}")
+    print(f"Saved run metadata: {run_meta_path}")
     print(f"Saved rules used: {RULES_USED_PATH}")
+    print()
 
     print("\n=== QUICK SUMMARY ===")
     print(summary_df.to_string(index=False))
     print("\n=== RUN METADATA ===")
     print(run_meta_df.to_string(index=False))
+
+    program_end_dt = datetime.now().astimezone()
+    total_seconds = time.perf_counter() - program_start_timer
+    total_minutes, remaining_seconds = divmod(total_seconds, 60)
+    print(f"\nProgramme finished: {program_end_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(
+        f"Total time taken: {int(total_minutes)} minutes "
+        f"and {remaining_seconds:.1f} seconds"
+    )
 
 
 if __name__ == "__main__":
