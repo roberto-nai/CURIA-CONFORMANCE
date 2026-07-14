@@ -122,6 +122,12 @@ Recommended end-to-end order:
 `llm_config.json` is keyed by model identifier. Each model entry specifies its
 provider and generation settings:
 
+Official model pages:
+
+- [`gpt-4.1-2025-04-14`](https://developers.openai.com/api/docs/models/gpt-4.1) — OpenAI
+- [`claude-sonnet-4-5-20250929`](https://www.anthropic.com/news/claude-sonnet-4-5) — Anthropic
+- [`llama3.2`](https://ollama.com/library/llama3.2) — Ollama
+
 ```json
 {
   "model-name": {
