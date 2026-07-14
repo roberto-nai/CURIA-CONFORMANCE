@@ -5,6 +5,7 @@
     "temperature": 0.0,
     "top_p": 1.0,
     "max_output_tokens": 512,
+    "seed": null,
     "response_format": "JSON",
     "tools": "disabled"
   },
@@ -14,6 +15,7 @@
     "temperature": 0.0,
     "top_p": 1.0,
     "max_output_tokens": 512,
+    "seed": null,
     "response_format": "JSON",
     "tools": "disabled"
   },
@@ -23,6 +25,7 @@
     "temperature": 0.0,
     "top_p": 1.0,
     "max_output_tokens": 512,
+    "seed": 42,
     "response_format": "JSON",
     "tools": "disabled"
   }

@@ -219,7 +219,7 @@ def load_llm_config(path: Path) -> Dict[str, Dict[str, Any]]:
         raise ValueError(f"{path} must contain a non-empty JSON object.")
 
     required = {
-        "provider", "temperature", "top_p", "max_output_tokens",
+        "provider", "temperature", "top_p", "max_output_tokens", "seed",
         "response_format", "tools",
     }
     for model, settings in config.items():
@@ -228,6 +228,21 @@ def load_llm_config(path: Path) -> Dict[str, Dict[str, Any]]:
         missing = required - settings.keys()
         if missing:
             raise ValueError(f"Model {model!r} is missing settings: {sorted(missing)}")
+
+        provider = str(settings["provider"]).strip().lower()
+        seed = settings["seed"]
+        if provider in {"openai", "anthropic"} and seed is not None:
+            raise ValueError(
+                f"Model {model!r} uses provider {settings['provider']!r}, "
+                "which does not support seed in the API used by this script; "
+                "set seed to null."
+            )
+        if provider == "ollama" and (
+            isinstance(seed, bool) or not isinstance(seed, int)
+        ):
+            raise ValueError(
+                f"Ollama model {model!r} requires seed to be an integer."
+            )
     return config
 
 
@@ -684,6 +699,8 @@ def call_llm_json(
         }
         if json_response:
             kwargs["response_format"] = {"type": "json_object"}
+        if provider == "ollama":
+            kwargs["seed"] = int(settings["seed"])
         resp = client.chat.completions.create(**kwargs)
         tokens_used = _safe_usage_total_tokens(resp)
         text = (resp.choices[0].message.content or "").strip()

@@ -135,7 +135,8 @@ Official model pages:
     "release_date": "YYYY-MM-DD",
     "temperature": 0.0,
     "top_p": 1.0,
-    "max_output_tokens": 256,
+    "max_output_tokens": 512,
+    "seed": null,
     "response_format": "JSON",
     "tools": "disabled"
   }
@@ -146,7 +147,10 @@ Supported providers are `OpenAI`, `Anthropic`, `Ollama`, and `Meta` through an
 OpenAI-compatible endpoint. For Anthropic, the script sends `temperature` only
 and leaves `top_p` at the model default because some Anthropic models reject
 requests containing both parameters. OpenAI, Ollama, and Meta receive both
-sampling parameters.
+sampling parameters. Set `seed` to `null` for OpenAI and Anthropic because the
+interfaces used here do not support it. Ollama supports reproducible outputs,
+so its entry uses an integer seed (currently `42`), which the script sends with
+each request. Provider/seed combinations are validated before inference.
 
 For a local Ollama model, ensure that Ollama is running and that the configured
 model is available before starting the disagreement study.
